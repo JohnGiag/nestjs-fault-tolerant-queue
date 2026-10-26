@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  # Docs-only changes can't affect the tests, so they don't trigger a run.
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE']
+
+jobs:
+  test:
+    name: Lint, audit, unit and e2e tests
+    runs-on: ubuntu-latest
+    services:
+      # The e2e suite uses redis://localhost:6379/15 by default.
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # Shipped dependencies only: dev tools never reach the Docker image.
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:e2e
+
+  chaos:
+    name: Docker stack crash and load tests
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # The crash test script talks to Redis through bullmq from node_modules.
+      - run: npm ci
+      - name: Start stack (Redis + 3 app replicas)
+        run: docker compose up -d --build --wait
+      - run: npm run test:chaos
+      # A regression check, not a benchmark: CI runners are smaller and noisier than the machine
+      # behind the README numbers, so the rate is well under what any runner handles. It still
+      # fails on any error, a dropped request, p95 over 50 ms or p99 over 200 ms.
+      - name: Short load test (30 s at 200 req/s)
+        run: npm run test:load
+        env:
+          RATE: '200'
+          DURATION_S: '30'
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
+      - name: Tear down
+        if: always()
+        run: docker compose down

@@ -1,0 +1,58 @@
+# Local development: docker compose up -d redis   (then npm run start:dev)
+# Full stack, 3 app replicas sharing one Redis: docker compose up -d --build --wait
+# Crash test against the full stack: npm run test:chaos
+services:
+  redis:
+    image: redis:7.4-alpine
+    # BullMQ needs keys to stay put: evicting a job hash under memory pressure corrupts the queue.
+    command: ['redis-server', '--maxmemory-policy', 'noeviction', '--appendonly', 'yes']
+    # Named: an anonymous volume is replaced on `down`/`up`, losing every queued job and the DLQ.
+    # `docker compose down -v` still wipes it on purpose.
+    volumes:
+      - redis-data:/data
+    # Loopback only: this Redis has no password, and on Linux Docker's published ports bypass the
+    # host firewall. Tests, the crash test and CI all connect through localhost.
+    ports:
+      - '127.0.0.1:6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  app:
+    build: .
+    # Also covers boot races after a Docker restart: the app exits if Redis isn't up yet and is retried.
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      WORKER_CONCURRENCY: '5'
+      # 0 by default; the load test sets 1 to stand in for many clients behind one proxy.
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-0}
+    # Each replica runs the API and a worker; they compete for jobs from the same queue.
+    deploy:
+      replicas: 3
+    # Room for workers to finish active jobs on docker stop before SIGKILL (default is 10s).
+    stop_grace_period: 30s
+    # Ephemeral host ports (three replicas can't share one), loopback only: the API has no auth.
+    ports:
+      - '127.0.0.1::3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Load generator, only started by `npm run test:load` (profile "load").
+  k6:
+    image: grafana/k6:1.0.0
+    profiles: [load]
+    environment:
+      RATE: ${RATE:-500}
+      DURATION_S: ${DURATION_S:-60}
+    volumes:
+      - ./test/load:/scripts:ro
+    command: run /scripts/ingest.js
+    depends_on:
+      - app
+
+volumes:
+  redis-data:
